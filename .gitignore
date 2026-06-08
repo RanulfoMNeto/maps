@@ -1,0 +1,8 @@
+node_modules
+.next
+.env*.local
+npm-debug.log*
+data/car-standard
+tsconfig.tsbuildinfo
+*.log
+car/minas_gerais/**/*.zip
