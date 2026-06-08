@@ -11,6 +11,7 @@ const execFileAsync = promisify(execFile);
 const PROJECT_ROOT = process.cwd();
 const OUTPUT_DIR = path.join(PROJECT_ROOT, "data/car-standard");
 const CHECKPOINT_FILE = path.join(OUTPUT_DIR, "ingest-state.json");
+const LOCK_FILE = path.join(OUTPUT_DIR, "ingest.lock.json");
 const RESET = process.argv.includes("--reset");
 const DRY_RUN = process.argv.includes("--dry-run");
 const FORCE = process.argv.includes("--force");
@@ -59,35 +60,45 @@ async function main() {
     console.log("Modo conferencia: nenhum GeoPackage sera criado ou alterado.");
   }
 
-  const checkpoint = RESET || FORCE ? createEmptyCheckpoint() : await readCheckpoint();
-  const manifest = {
-    generatedAt: new Date().toISOString(),
-    states: {}
-  };
-
-  for (const state of STATES) {
-    const databasePath = path.join(PROJECT_ROOT, state.databaseFile);
-    if (RESET && existsSync(databasePath)) {
-      await fs.rm(databasePath, { force: true });
-      await fs.rm(`${databasePath}-shm`, { force: true });
-      await fs.rm(`${databasePath}-wal`, { force: true });
-    }
-
-    console.log(`\n== ${state.label} ==`);
-    for (const layer of state.layers) {
-      await ingestLayer(state, layer, databasePath, checkpoint);
-    }
-
-    const cities = DRY_RUN ? [] : await readCities(databasePath, state.areaTableName, state.uf);
-    manifest.states[state.id] = { cities };
-    if (!DRY_RUN) {
-      console.log(`Municípios indexados: ${cities.length}`);
-    }
+  if (!DRY_RUN) {
+    await acquireIngestLock();
   }
 
-  if (!DRY_RUN) {
-    await fs.writeFile(path.join(OUTPUT_DIR, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-    console.log("\nManifesto gravado em data/car-standard/manifest.json");
+  try {
+    const checkpoint = RESET || FORCE ? createEmptyCheckpoint() : await readCheckpoint();
+    const manifest = {
+      generatedAt: new Date().toISOString(),
+      states: {}
+    };
+
+    for (const state of STATES) {
+      const databasePath = path.join(PROJECT_ROOT, state.databaseFile);
+      if (RESET && existsSync(databasePath)) {
+        await fs.rm(databasePath, { force: true });
+        await fs.rm(`${databasePath}-shm`, { force: true });
+        await fs.rm(`${databasePath}-wal`, { force: true });
+      }
+
+      console.log(`\n== ${state.label} ==`);
+      for (const layer of state.layers) {
+        await ingestLayer(state, layer, databasePath, checkpoint);
+      }
+
+      const cities = DRY_RUN ? [] : await readCities(databasePath, state.areaTableName, state.uf);
+      manifest.states[state.id] = { cities };
+      if (!DRY_RUN) {
+        console.log(`Municípios indexados: ${cities.length}`);
+      }
+    }
+
+    if (!DRY_RUN) {
+      await fs.writeFile(path.join(OUTPUT_DIR, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+      console.log("\nManifesto gravado em data/car-standard/manifest.json");
+    }
+  } finally {
+    if (!DRY_RUN) {
+      await releaseIngestLock();
+    }
   }
 }
 
@@ -137,7 +148,7 @@ async function ingestLayer(state, layer, databasePath, checkpoint) {
       "-t_srs",
       "EPSG:4326",
       "-lco",
-      "SPATIAL_INDEX=YES",
+      "SPATIAL_INDEX=NO",
       "-skipfailures"
     ];
 
@@ -156,8 +167,22 @@ async function ingestLayer(state, layer, databasePath, checkpoint) {
     await runWithProgress("ogr2ogr", args, `${layer.id} ${index + 1}/${shapefiles.length}: ${shpName}`);
   }
 
+  await createSpatialIndex(databasePath, layer);
+
   markLayerComplete(checkpoint, state.id, layer.id, sourceSignature);
   await writeCheckpoint(checkpoint);
+}
+
+async function createSpatialIndex(databasePath, layer) {
+  await runWithProgress(
+    "ogrinfo",
+    [
+      databasePath,
+      "-sql",
+      `SELECT gpkgAddSpatialIndex('${escapeSqlLiteral(layer.tableName)}', 'geom')`
+    ],
+    `indice espacial ${layer.id}`
+  );
 }
 
 async function listShapefiles(zipPath) {
@@ -254,6 +279,53 @@ function createEmptyCheckpoint() {
   };
 }
 
+async function acquireIngestLock() {
+  const existing = await readIngestLock();
+  if (existing && isPidRunning(existing.pid)) {
+    throw new Error(
+      `Outra ingestao parece estar em execucao (pid ${existing.pid}, iniciada em ${existing.startedAt}). Aguarde terminar ou finalize esse processo antes de iniciar outra.`
+    );
+  }
+
+  await fs.writeFile(
+    LOCK_FILE,
+    `${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }, null, 2)}\n`,
+    "utf8"
+  );
+}
+
+async function releaseIngestLock() {
+  const existing = await readIngestLock();
+  if (!existing || existing.pid === process.pid) {
+    await fs.rm(LOCK_FILE, { force: true });
+  }
+}
+
+async function readIngestLock() {
+  if (!existsSync(LOCK_FILE)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(await fs.readFile(LOCK_FILE, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function isPidRunning(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function readCheckpoint() {
   if (!existsSync(CHECKPOINT_FILE)) {
     return createEmptyCheckpoint();
@@ -319,13 +391,16 @@ async function runWithProgress(command, args, label) {
     });
     const renderer = createProgressRenderer(label);
     const output = [];
+    let progressBuffer = "";
 
     renderer.update(0);
+    const heartbeat = setInterval(() => renderer.heartbeat(), 30_000);
 
     const handleData = (chunk) => {
       const text = chunk.toString();
       output.push(text);
-      const progressMatches = text.matchAll(/(\d{1,3})(?=\.\.\.)|(\d{1,3})(?=\s*-\s*done)/g);
+      progressBuffer = `${progressBuffer}${text}`.slice(-1200);
+      const progressMatches = progressBuffer.matchAll(/(\d{1,3})(?=\.\.\.)|(\d{1,3})(?=\s*-\s*done)/g);
       for (const match of progressMatches) {
         renderer.update(Number(match[1] ?? match[2]));
       }
@@ -334,10 +409,12 @@ async function runWithProgress(command, args, label) {
     child.stdout.on("data", handleData);
     child.stderr.on("data", handleData);
     child.on("error", (error) => {
+      clearInterval(heartbeat);
       renderer.finish(false);
       reject(error);
     });
     child.on("close", (code) => {
+      clearInterval(heartbeat);
       renderer.finish(code === 0);
       if (code === 0) {
         resolve();
@@ -351,20 +428,34 @@ async function runWithProgress(command, args, label) {
 function createProgressRenderer(label) {
   let lastPrintedBucket = -1;
   let lastPercent = 0;
+  let lastHeartbeatMinute = -1;
+  const startedAt = Date.now();
 
   return {
-    update(percent) {
+    update(percent, force = false) {
       const normalized = clampProgress(percent);
       lastPercent = normalized;
       if (process.stdout.isTTY) {
-        process.stdout.write(`\r${progressLine(label, normalized)}`);
+        process.stdout.write(`\r${progressLine(label, normalized, startedAt)}`);
         return;
       }
 
       const bucket = Math.floor(normalized / 10);
-      if (bucket !== lastPrintedBucket || normalized === 100) {
+      if (force || bucket !== lastPrintedBucket || normalized === 100) {
         lastPrintedBucket = bucket;
-        console.log(progressLine(label, normalized));
+        console.log(progressLine(label, normalized, startedAt));
+      }
+    },
+    heartbeat() {
+      if (process.stdout.isTTY) {
+        this.update(lastPercent, true);
+        return;
+      }
+
+      const minute = Math.floor((Date.now() - startedAt) / 60_000);
+      if (minute !== lastHeartbeatMinute) {
+        lastHeartbeatMinute = minute;
+        this.update(lastPercent, true);
       }
     },
     finish(success) {
@@ -372,16 +463,34 @@ function createProgressRenderer(label) {
         this.update(100);
       }
       if (process.stdout.isTTY) {
-        process.stdout.write(`${success ? "" : `\r${progressLine(label, lastPercent)}`}\n`);
+        process.stdout.write(`${success ? "" : `\r${progressLine(label, lastPercent, startedAt)}`}\n`);
       }
     }
   };
 }
 
-function progressLine(label, percent) {
+function progressLine(label, percent, startedAt) {
   const filled = Math.round((percent / 100) * BAR_WIDTH);
   const bar = `${"#".repeat(filled)}${"-".repeat(BAR_WIDTH - filled)}`;
-  return `  ${label} [${bar}] ${String(percent).padStart(3)}%`;
+  return `  ${label} [${bar}] ${String(percent).padStart(3)}% decorrido ${formatElapsed(Date.now() - startedAt)}`;
+}
+
+function formatElapsed(milliseconds) {
+  const seconds = Math.floor(milliseconds / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+
+  if (minutes >= 60) {
+    const hours = Math.floor(minutes / 60);
+    const remainingMinutes = minutes % 60;
+    return `${hours}h${String(remainingMinutes).padStart(2, "0")}m`;
+  }
+
+  return `${minutes}m${String(remainingSeconds).padStart(2, "0")}s`;
+}
+
+function escapeSqlLiteral(value) {
+  return String(value).replace(/'/g, "''");
 }
 
 function clampProgress(percent) {

@@ -22,6 +22,11 @@ type IngestState = {
   states?: Record<string, { layers?: Record<string, { completedAt?: string }> }>;
 };
 
+type IngestLock = {
+  pid?: number;
+  startedAt?: string;
+};
+
 type StandardCarQuery = {
   stateId: string;
   layerId: string;
@@ -37,12 +42,13 @@ const QUERY_TIMEOUT_MS = 45_000;
 export function getStandardCarMetadata(): StandardCarMetadata {
   const manifest = readIngestManifest();
   const ingestState = readIngestState();
+  const ingestRunning = isIngestRunning();
   const generatedAt = manifest.generatedAt ?? ingestState.updatedAt ?? new Date().toISOString();
 
   return {
     generatedAt,
     states: STANDARD_CAR_STATES.map((state) => {
-      const prepared = state.layers.some((layer) => isLayerPrepared(ingestState, state.id, layer.id));
+      const prepared = !ingestRunning && state.layers.some((layer) => isLayerPrepared(ingestState, state.id, layer.id));
       const manifestState = manifest.states?.[state.id];
       return {
         ...state,
@@ -50,7 +56,7 @@ export function getStandardCarMetadata(): StandardCarMetadata {
         cities: manifestState?.cities ?? [],
         layers: state.layers.map((layer) => ({
           ...layer,
-          prepared: isLayerPrepared(ingestState, state.id, layer.id)
+          prepared: !ingestRunning && isLayerPrepared(ingestState, state.id, layer.id)
         }))
       };
     })
@@ -68,6 +74,10 @@ export async function queryStandardCarGeoJson(query: StandardCarQuery) {
 
   if (!state || !layer) {
     throw new StandardCarError(404, "Camada estadual do CAR não encontrada.");
+  }
+
+  if (isIngestRunning()) {
+    throw new StandardCarError(503, "Base estadual em ingestão. Aguarde o npm run car:ingest terminar.");
   }
 
   const databasePath = resolveProjectPath(state.databaseFile);
@@ -175,6 +185,37 @@ function readIngestState(): IngestState {
 
 function isLayerPrepared(ingestState: IngestState, stateId: string, layerId: string) {
   return Boolean(ingestState.states?.[stateId]?.layers?.[layerId]?.completedAt);
+}
+
+function isIngestRunning() {
+  const lock = readIngestLock();
+  return Boolean(lock?.pid && isPidRunning(lock.pid));
+}
+
+function readIngestLock(): IngestLock | null {
+  const lockPath = resolveProjectPath("data/car-standard/ingest.lock.json");
+  if (!existsSync(lockPath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(readFileSync(lockPath, "utf8")) as IngestLock;
+  } catch {
+    return null;
+  }
+}
+
+function isPidRunning(pid: number) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function resolveProjectPath(relativePath: string) {

@@ -6,3 +6,4 @@ data/car-standard
 tsconfig.tsbuildinfo
 *.log
 car/minas_gerais/**/*.zip
+/car.zip
